@@ -1,0 +1,14 @@
+# Python virtual environment
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Saved models (they are too large for GitHub)
+jammer_agent_v1/
+
+# IDE and OS specific files
+.idea/
+.vscode/
+*.DS_Store
