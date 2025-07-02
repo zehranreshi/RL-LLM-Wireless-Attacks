@@ -1,0 +1,8 @@
+# requirements.txt
+torch
+transformers
+trl
+accelerate
+bitsandbytes
+scipy
+tqdm
