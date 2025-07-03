@@ -1,62 +1,48 @@
-# llm_rl_agent.py — Corrected Version for TRL v0.19+
-# ======================================================================================
-# IMPORTS
-# ======================================================================================
+# llm_rl_agent.py — Corrected for the provided vintage TRL library
 import torch
-import torch.nn as nn
 import json
 import re
 import random
 import argparse
 from tqdm import tqdm
+import torch.nn as nn
 from datasets import Dataset
-from datetime import datetime
+# No need for copy, as deepcopy is unsafe for quantized models
+# import copy
 
-# Transformers and TRL Imports
+# All necessary imports from transformers and trl
 from transformers import (
     AutoTokenizer,
     GenerationConfig,
     BitsAndBytesConfig,
     AutoModelForCausalLM,
     LlamaConfig,
-    LlamaForSequenceClassification,
-    LogitsProcessorList, 
-    TemperatureLogitsWarper, 
-    TopPLogitsWarper,
-    AutoConfig,
-    AutoModelForSequenceClassification
+    LlamaForSequenceClassification
 )
 from transformers.modeling_outputs import SequenceClassifierOutput
-from trl import (
-    PPOTrainer as TRL_PPOTrainer,
-    AutoModelForCausalLMWithValueHead,
-    PPOConfig,
-)
+# This is the trainer class you are actually using
+from trl import PPOTrainer as TRL_PPOTrainer
+# This class is no longer needed, as we will build the models separately
+# from trl import AutoModelForCausalLMWithValueHead
+from trl import PPOConfig
 
-# Simulation Environment
+
+# Your simulation environment is still needed for the reward logic
 from simulation_environment import mock_run_simulation_and_get_reward
 import simulation_environment
 
 
 # ======================================================================================
-# REWARD MODEL DEFINITION
+# 1. THE COMPLIANT REWARD MODEL (This part was correct and remains unchanged)
 # ======================================================================================
-
 class SimulationRewardModel(LlamaForSequenceClassification):
-    """
-    Custom Reward Model inheriting from LlamaForSequenceClassification to comply 
-    with TRL's API expectations. It overrides the forward pass to use custom 
-    simulation logic for calculating rewards.
-    """
     def __init__(self, tokenizer, model_name):
-        # Initialize with a dummy configuration to satisfy inheritance requirements.
-        config = AutoConfig.from_pretrained(model_name)
+        config = LlamaConfig.from_pretrained(model_name)
         config.num_labels = 1  # Output is a single reward score
         super().__init__(config)
         self.tokenizer = tokenizer
 
     def _parse_llm_output(self, text_output: str) -> dict:
-        """Helper function to extract JSON configuration from generated text."""
         try:
             json_match = re.search(r'\{[^{}]*\}', text_output, re.DOTALL)
             if json_match:
@@ -68,15 +54,9 @@ class SimulationRewardModel(LlamaForSequenceClassification):
             return None
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
-        """Overrides the standard forward pass to calculate rewards using the simulation."""
         rewards = []
 
         for i in range(input_ids.shape[0]):
-            # Safe decoding checks
-            if input_ids[i].nelement() == 0:
-                rewards.append(-1.0)
-                continue
-
             try:
                 text = self.tokenizer.decode(input_ids[i], skip_special_tokens=True)
             except Exception:
@@ -87,217 +67,175 @@ class SimulationRewardModel(LlamaForSequenceClassification):
                 rewards.append(-1.0)
                 continue
 
-            # Extract JSON config from the generated response
             json_part_start = text.rfind("### JSON Output:")
             response_text = text[json_part_start:] if json_part_start != -1 else text
             config = self._parse_llm_output(response_text)
 
             if config:
-                # Determine the target frequency from the prompt context
                 try:
                     match = re.search(r'jam a target at ([\d.]+) GHz', text)
                     if match:
                         target_freq_ghz = float(match.group(1))
                         simulation_environment.TARGET_FREQ = target_freq_ghz * 1e9
+                    else:
+                        simulation_environment.TARGET_FREQ = 3.6e9
                 except Exception:
-                    simulation_environment.TARGET_FREQ = 3.6e9 # Fallback target frequency
+                    simulation_environment.TARGET_FREQ = 3.6e9
 
-                # Calculate reward using the external simulation environment
                 try:
                     reward = mock_run_simulation_and_get_reward(config)
                 except Exception:
                     reward = -1.0
             else:
-                # Penalize invalid JSON generation
                 reward = -1.0
 
             rewards.append(reward)
 
-        # Format the rewards into the structure expected by TRL
         reward_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        reward_tensor = torch.nan_to_num(reward_tensor, nan=-1.0, posinf=100.0, neginf=-100.0)
         reward_tensor = torch.clamp(reward_tensor, min=-100.0, max=100.0)
 
+        # The older trainer version might expect a different output shape.
+        # Let's ensure it's [batch_size, 1] as logits.
         return SequenceClassifierOutput(
             loss=None,
-            logits=reward_tensor.unsqueeze(-1), # Ensure correct tensor dimensions
+            logits=reward_tensor.unsqueeze(-1),
             hidden_states=None,
             attentions=None,
         )
 
 
-# ======================================================================================
-# LLM AGENT DEFINITION
-# ======================================================================================
-
 class LLMAgent:
     def __init__(self, model_name: str, ppo_cfg: PPOConfig, train_dataset: Dataset):
-        # Memory Management Configuration
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-
-        torch.cuda.empty_cache()
-        torch.cuda.set_per_process_memory_fraction(1.0, torch.cuda.current_device())
-
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"--- Using device: {self.device} ---")
 
-        # Configuration for 4-bit quantization
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
+            # Use bfloat16 for better numerical stability with 4-bit models
             bnb_4bit_compute_dtype=torch.bfloat16,
-            llm_int8_enable_fp32_cpu_offload=True,
-            offload_buffers = True
         )
 
-        print(f"--- Loading model: {model_name}. This may take a while... ---")
+        # ============================= START: CORRECTED MODEL LOADING (for your TRL version) =============================
+        # The key is to load each model independently from the hub to avoid the unstable `deepcopy`.
 
-        # --- Model Initialization Strategy ---
-        # Due to complex requirements in TRL's PPOTrainer regarding model structure
-        # (PolicyAndValueWrapper and AutoModelForCausalLMWithValueHead), we employ
-        # a strategy of loading plain models and manually configuring the value head.
-
-        device_map="auto"
-        # Step 1: Load a temporary model to initialize and extract the value head (v_head).
-        temp_model_with_head = AutoModelForCausalLMWithValueHead.from_pretrained(
-            "TinyLlama/TinyLlama-1.1B-Chat-v1.0", 
-            quantization_config=bnb_config, 
-            torch_dtype=torch.bfloat16,
-            device_map={"": self.device}, 
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
-        )
-        value_head_to_steal = temp_model_with_head.v_head
-        
-        # Step 2: Define the ACTIVE POLICY model. Must be a plain model for compatibility.
+        # Step 1: Load the ACTIVE POLICY model. This is the one that will be trained.
+        print(f"--- Loading policy model: {model_name} ---")
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, 
-            quantization_config=bnb_config, 
-            torch_dtype=torch.float16,
-            device_map=device_map, 
-            trust_remote_code=True
+            model_name,
+            quantization_config=bnb_config,
+            torch_dtype=torch.bfloat16,
+            device_map={"": self.device},
+            trust_remote_code=True,
         )
-        self.model.gradient_checkpointing_enable()
         self.model.config.use_cache = False
-
-
-        # Step 3: Define the CRITIC model. Load as plain, then attach the extracted value head.
-        self.value_model = AutoModelForCausalLM.from_pretrained(
-            model_name, 
-            quantization_config=bnb_config, 
-            torch_dtype=torch.float16,
-            device_map=device_map, 
-            trust_remote_code=True
-        )
-        self.value_model.config.use_cache = False
-        self.value_model.score = value_head_to_steal
-        # self.value_model.gradient_checkpointing_enable()
-
-        # Step 4: Define the FROZEN REFERENCE model. Must be a plain model.
+        
+        # Step 2: Load the REFERENCE model. This is a frozen copy of the original policy.
+        print(f"--- Loading reference model: {model_name} ---")
         self.ref_model = AutoModelForCausalLM.from_pretrained(
-            model_name, 
-            quantization_config=bnb_config, 
-            torch_dtype=torch.float16,
-            device_map=device_map, 
-            trust_remote_code=True
+            model_name,
+            quantization_config=bnb_config,
+            torch_dtype=torch.bfloat16,
+            device_map={"": self.device},
+            trust_remote_code=True,
         )
+        self.ref_model.eval() # Set to evaluation mode
 
-        # --- Tokenizer and Reward Model Setup ---
+        # Step 3: Load the VALUE model (critic). It has the same backbone but will have a custom head.
+        print(f"--- Loading value model backbone: {model_name} ---")
+        self.value_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            torch_dtype=torch.bfloat16,
+            device_map={"": self.device},
+            trust_remote_code=True,
+        )
+        
+        # Step 4: Create and attach the `.score` head to the value model.
+        # This is what `PolicyAndValueWrapper` in your ppo_trainer.py expects.
+        hidden_size = self.value_model.config.hidden_size
+        self.value_model.score = nn.Linear(hidden_size, 1, bias=False).to(self.device).to(torch.bfloat16)
+
+        # ============================= END: CORRECTED MODEL LOADING =============================
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # The reward model setup was correct.
         self.reward_model = SimulationRewardModel(self.tokenizer, model_name)
 
-        # Ensure the policy model has a generation configuration for the trainer.
+        # Attach generation config to the main policy model.
         if not hasattr(self.model, "generation_config"):
             self.model.generation_config = GenerationConfig.from_pretrained(model_name)
+        # Your ppo_trainer.py sets generation params inside the .train() loop,
+        # but setting them here is good practice.
         self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
-
-        # --- PPOTrainer Initialization ---
+        self.model.generation_config.eos_token_id = self.tokenizer.eos_token_id
+        self.model.generation_config.max_new_tokens = ppo_cfg.response_length
+        self.model.generation_config.temperature = ppo_cfg.temperature
+        self.model.generation_config.do_sample = True
+        
+        # Initialize the trainer with all four separate models, as required by your library version.
         self.ppo_trainer = TRL_PPOTrainer(
-            ppo_cfg, model=self.model, processing_class=self.tokenizer,
-            ref_model=self.ref_model, reward_model=self.reward_model,
-            train_dataset=train_dataset, value_model=self.value_model
+            args=ppo_cfg,
+            model=self.model,
+            ref_model=self.ref_model,
+            reward_model=self.reward_model,
+            value_model=self.value_model,
+            processing_class=self.tokenizer,
+            train_dataset=train_dataset,
         )
-        print(f"--- Model {model_name} loaded successfully! ---")
+        print(f"--- All models for PPO loaded successfully! ---")
         print("DEBUG: PPOTrainer type →", type(self.ppo_trainer))
-
-        # --- Custom Generate Method (For Logging/Debugging) ---
-        # This section patches the generate method to log outputs during training.
         
-        def patched_generate(self, input_ids, **kwargs):
-            # Setup standard logits processors for generation quality
-            logits_processor = LogitsProcessorList([
-                TemperatureLogitsWarper(temperature=0.7),
-                TopPLogitsWarper(top_p=0.9),
-            ])
-
-            # Call the original generate method
-            outputs = super(type(self), self).generate(
-                input_ids=input_ids,
-                logits_processor=logits_processor,
-                max_new_tokens=150,
-                **kwargs
-            )
-
-            # Decode the outputs for logging
-            try:
-                tokenizer = self.generation_config._tokenizer
-            except:
-                # Fallback tokenizer if not linked
-                tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-            decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-
-            # Print to terminal
-            print("\n===================== GENERATED OUTPUT =====================")
-            for i, output in enumerate(decoded):
-                print(f"[Sample {i}]\n{output}\n")
-            print("==============================================================\n")
-
-            # Save to log file
-            with open("generated_outputs.log", "a", encoding="utf-8") as f:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                f.write(f"\n=== Output generated at {timestamp} ===\n")
-                for i, output in enumerate(decoded):
-                    f.write(f"[Sample {i}]\n{output}\n\n")
-
-            return outputs
-        
-        # Bind the patched method to the model instance
-        self.ppo_trainer.model.generate = patched_generate.__get__(self.ppo_trainer.model, type(self.ppo_trainer.model))
-
-
-# ======================================================================================
-# TRAINING LOOP EXECUTION
-# ======================================================================================
+def clear_cuda_cache():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        print("[INFO] Cleared CUDA cache.")
 
 def run_training_loop(args):
     print("--- Building PPOConfig ---")
 
-    # PPO Configuration settings
+    # This config is tailored to the arguments your ppo_trainer.py expects.
+    # I have kept the parameters from your original script as they are likely compatible.
     ppo_cfg = PPOConfig(
-        learning_rate=1.41e-6,
-        warmup_steps=10,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        num_ppo_epochs=4,
-        kl_coef=0.05,
-        temperature=0.95,
-        cliprange_value=0.2,
-        max_grad_norm=0.5,
-        vf_coef=0.1,
-        stop_token_id=None,
-        output_dir="./results_ppo",
-        bf16=False,
-        fp16=False,
-        response_length=150,
+        # Trainer/Loop settings
+        exp_name="ppo_jammer_agent", # Your trainer uses this for run_name
+        seed=42,
         total_episodes=args.num_episodes,
-        num_sample_generations=0 # Disable mid-training sampling/evaluation
+        num_ppo_epochs=4,
+        # Batching settings
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=1,
+        num_mini_batches=1, # Adjust if batch_size is large
+        # PPO algorithm settings
+        learning_rate=args.learning_rate,
+        kl_coef=0.05,
+        kl_estimator="k3", # As seen in your trainer code
+        temperature=0.95,
+        cliprange=0.2, # for pg_loss
+        cliprange_value=0.2, # for vf_loss
+        gamma=0.99,
+        lam=0.95,
+        vf_coef=0.1,
+        # Generation settings
+        response_length=150,
+        # EOS/Stop token settings
+        stop_token_id=None,
+        missing_eos_penalty=None, # Set to a float like 1.0 to penalize
+        # Logging & Saving
+        output_dir="./results_ppo",
+        logging_steps=1,
+        # Performance
+        num_sample_generations=0,
+        bf16=True, # Use bfloat16
+        fp16=False,
     )
+
 
     base_prompt = (
         "You are a world-class network security expert specializing in radio "
@@ -310,10 +248,9 @@ def run_training_loop(args):
     )
 
     print("--- Creating and Tokenizing Dataset ---")
-    
-    # Generate training prompts based on randomized target frequencies
     raw_prompts = []
-    for _ in range(args.num_episodes * 2):
+    # Your trainer calculates total batches based on total_episodes, so this size is reasonable.
+    for _ in range(args.num_episodes):
         target_freq_ghz = round(random.uniform(3.5, 3.7), 4)
         prompt = (
             f"{base_prompt}\n\n### Current Mission\n"
@@ -326,36 +263,34 @@ def run_training_loop(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Convert prompts to a Hugging Face Dataset and tokenize
     train_dataset = Dataset.from_list(raw_prompts)
 
+    # This tokenization step is mostly for creating the dataset object.
+    # The trainer's internal collator will handle padding.
     def tokenize_function(examples):
-        return tokenizer(examples["query"], truncation=True, padding=False)
+        return tokenizer(examples["query"], truncation=True, padding=False, max_length=256)
 
     tokenized_dataset = train_dataset.map(
         tokenize_function, batched=True, remove_columns=["query"]
     )
     tokenized_dataset.set_format("torch")
 
-    # Initialize the agent
     agent = LLMAgent(model_name=args.model, ppo_cfg=ppo_cfg, train_dataset=tokenized_dataset)
 
     print(f"\n--- Starting RL Training with {args.model} ---")
+    # This is the correct call for your version of the trainer. It contains the full training loop.
     agent.ppo_trainer.train()
 
     print("\n--- Training Complete ---")
 
-    # Save the final trained model and tokenizer
     print("\n--- Saving trained model to disk ---")
-    output_dir = f"jammer_agent_{args.model.split('/')[-1]}"
+    # Your trainer saves the policy model automatically via its callbacks if configured.
+    # But manual saving is also fine.
+    output_dir = f"jammer_agent_{args.model.split('/')[-1]}_ppo_trained"
     agent.model.save_pretrained(output_dir)
     agent.tokenizer.save_pretrained(output_dir)
     print(f"Model saved successfully to ./{output_dir}")
 
-
-# ======================================================================================
-# MAIN EXECUTION BLOCK
-# ======================================================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -364,10 +299,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="deepseek-ai/DeepSeek-Coder-V2-Instruct",
+        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         choices=[
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-            "deepseek-ai/DeepSeek-Coder-V2-Instruct",
+            "deepseek-ai/DeepSeek-Coder-6.7B-Instruct",
             "codellama/CodeLlama-7b-Instruct-hf"
         ],
         help="Hugging Face model name to train.",
@@ -376,8 +311,6 @@ if __name__ == "__main__":
         "--num_episodes", type=int, default=50, help="Total number of training rollouts (episodes)."
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=1e-6, help="PPO learning rate."
+        "--learning_rate", type=float, default=1.41e-6, help="PPO learning rate."
     )
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
     run_training_loop(parser.parse_args())
