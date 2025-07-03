@@ -1,0 +1,23 @@
+use this to make sure the code puts the cache in this New Volume (for future references)
+
+--------------------------------------------------------------------
+mkdir -p "/media/secureslicing/New Volume/hf_cache"
+echo 'export HF_HOME="/media/secureslicing/New Volume/hf_cache"' \
+     >> ~/.bashrc
+echo 'export TRANSFORMERS_CACHE="$HF_HOME/transformers"' \
+     >> ~/.bashrc
+source ~/.bashrc        
+---------------------------------------------------------------------
+
+confirm where the caches are stored with this:
+
+--------------------------------------------------------------------
+python - <<'PY'
+from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+import os
+print("HF cache root (from lib):", HUGGINGFACE_HUB_CACHE)
+print("HF cache root (from env):", os.environ.get("HF_HOME"))
+PY
+--------------------------------------------------------------------
+
+
